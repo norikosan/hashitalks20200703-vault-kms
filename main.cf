@@ -1,0 +1,185 @@
+// 編集者ロールだけの場合、プラスで「ロール管理者」があれば行けると思います。
+// オーナー権限があれば余裕。。。？
+
+terraform {
+  required_version = ">= 0.13.0"
+}
+
+provider "google" {
+  region  = var.region
+  project = var.vault_project
+}
+
+data "google_project" "gcs_project" {
+  project_id = var.gcs_project
+}
+
+// auto unseal 用の キーリング等
+// https://learn.hashicorp.com/vault/operations/autounseal-gcp-kms
+resource "google_kms_key_ring" "auto_unseal_key_ring" {
+   project  = var.vault_project
+   name     = "auto-unseal-keyring"
+   location = "global"
+}
+
+# Create a crypto key for the key ring
+resource "google_kms_crypto_key" "auto_unseal_key_ring_key" {
+   name            = "auto-unseal-key-ring-key"
+   key_ring        = google_kms_key_ring.auto_unseal_key_ring.self_link
+   rotation_period = "100000s"
+}
+
+// TLS証明書の作成
+provider "acme" {
+  server_url = "https://acme-v02.api.letsencrypt.org/directory"
+}
+
+resource "tls_private_key" "private_key" {
+  algorithm = "RSA"
+}
+
+resource "acme_registration" "reg" {
+  account_key_pem = tls_private_key.private_key.private_key_pem
+  email_address   = var.mailaddress
+}
+
+resource "acme_certificate" "certificate_test" {
+  account_key_pem           = acme_registration.reg.account_key_pem
+  common_name               = var.common_name
+
+  dns_challenge {
+    provider = "gcloud"
+    config = {
+      GCE_PROJECT = var.dns_project
+    }
+  }
+}
+
+// とりあえずローカルでしか使わないので 127.0.0.1 をつけてしまう
+// 新しくゾーンを作成する場合は変更してください。
+data "google_dns_managed_zone" "dns_zone" {
+  name     = var.dns_managed_zone
+  project  = var.dns_project
+}
+
+resource "google_dns_record_set" "a" {
+  name         = "${var.common_name}."
+  managed_zone = var.dns_managed_zone
+  type         = "A"
+  ttl          = 86400
+  project      = var.dns_project
+
+  rrdatas = ["127.0.0.1"]
+}
+
+
+// IAP経由でSSHするのに以下のロールが必要なのでアタッチ
+resource "google_project_iam_member" "user" {
+  role   = "roles/iap.tunnelResourceAccessor"
+  member = "user:${var.user}"
+}
+
+// IAP用のIPアドレスの許可
+resource "google_compute_firewall" "iap" {
+  name    = "test-firewall"
+  network = google_compute_network.net.name
+
+  allow {
+    protocol = "tcp"
+    ports    = ["22"]
+  }
+  source_ranges = [
+    "35.235.240.0/20"
+  ]
+}
+
+// VPCの作成
+resource "google_compute_network" "net" {
+  name = "vault-test-network"
+}
+
+// subnetworkの作成
+resource "google_compute_subnetwork" "subnet" {
+  name          = "vault-test-subnet"
+  network       = google_compute_network.net.id
+  ip_cidr_range = "10.0.0.0/16"
+  region        = var.region
+}
+
+// subnetworkから外に出るためのルータを設定
+resource "google_compute_router" "router" {
+  name    = "vault-test-router"
+  region  = google_compute_subnetwork.subnet.region
+  network = google_compute_network.net.id
+
+  bgp {
+    asn = 64514
+  }
+}
+
+// NATの設定
+resource "google_compute_router_nat" "nat" {
+  name                               = "vault-test-nat"
+  router                             = google_compute_router.router.name
+  region                             = google_compute_router.router.region
+  nat_ip_allocate_option             = "AUTO_ONLY"
+  source_subnetwork_ip_ranges_to_nat = "ALL_SUBNETWORKS_ALL_IP_RANGES"
+
+  log_config {
+    enable = true
+    filter = "ERRORS_ONLY"
+  }
+}
+
+// Vaultをインストールするインスタンスの設定
+// startup-script を利用してVaultのインストールまで行います
+resource "google_compute_instance" "default" {
+  name         = "test-vm-kms-vault"
+  machine_type = "f1-micro"
+  project      = var.vault_project
+  zone         = "asia-northeast1-b"
+
+  network_interface {
+    network = google_compute_network.net.id
+  }
+
+  // スクリプトに直接記述出来ないのでメタデータに入れて送ります。
+  metadata = {
+    ssl_prikey = acme_certificate.certificate_test.private_key_pem
+    ssl_cert = acme_certificate.certificate_test.certificate_pem
+    ssl_issuer = acme_certificate.certificate_test.issuer_pem
+    vault_hostname = var.common_name
+  }
+  
+  metadata_startup_script = file("startup.sh")
+  //metadata_startup_script = "touch /tmp/test"
+  
+  boot_disk {
+    initialize_params {
+      image = "debian-cloud/debian-10"
+    }
+  }
+  service_account {
+    scopes = [
+      "cloud-platform",
+    ]
+  }
+}
+
+resource "google_kms_key_ring" "vault-keyring" {
+  name     = "vault-test-keyring"
+  location = var.region
+  project = var.vault_project
+}
+
+resource "google_project_iam_member" "gcs-serviceaccount-kms-role" {
+  project = var.vault_project
+  role   = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
+  member = "serviceAccount:service-${data.google_project.gcs_project.number}@gs-project-accounts.iam.gserviceaccount.com"
+}
+
+resource "google_project_iam_member" "vaul-gce-serviceaccount-kms-role" {
+  project = var.vault_project
+  role   = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
+  member = "serviceAccount:${google_compute_instance.default.service_account[0].email}"
+}
