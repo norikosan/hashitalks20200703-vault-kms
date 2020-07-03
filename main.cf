@@ -1,5 +1,6 @@
 // 編集者ロールだけの場合、プラスで「ロール管理者」があれば行けると思います。
-// オーナー権限があれば余裕。。。？
+// オーナー権限があれば余裕
+// 結構決め打ちもしてしまってるのでご注意ください
 
 terraform {
   required_version = ">= 0.13.0"
@@ -8,6 +9,10 @@ terraform {
 provider "google" {
   region  = var.region
   project = var.vault_project
+}
+
+data "google_project" "vault_project" {
+  project_id = var.vault_project
 }
 
 data "google_project" "gcs_project" {
@@ -22,7 +27,6 @@ resource "google_kms_key_ring" "auto_unseal_key_ring" {
    location = "global"
 }
 
-# Create a crypto key for the key ring
 resource "google_kms_crypto_key" "auto_unseal_key_ring_key" {
    name            = "auto-unseal-key-ring-key"
    key_ring        = google_kms_key_ring.auto_unseal_key_ring.self_link
@@ -30,6 +34,7 @@ resource "google_kms_crypto_key" "auto_unseal_key_ring_key" {
 }
 
 // TLS証明書の作成
+// https://www.terraform.io/docs/providers/acme/index.html
 provider "acme" {
   server_url = "https://acme-v02.api.letsencrypt.org/directory"
 }
@@ -74,10 +79,11 @@ resource "google_dns_record_set" "a" {
 
 
 // IAP経由でSSHするのに以下のロールが必要なのでアタッチ
-resource "google_project_iam_member" "user" {
-  role   = "roles/iap.tunnelResourceAccessor"
-  member = "user:${var.user}"
-}
+// ユーザの権限が足りない時にご利用ください。
+//resource "google_project_iam_member" "user" {
+//  role   = "roles/iap.tunnelResourceAccessor"
+//  member = "user:${var.user}"
+//}
 
 // IAP用のIPアドレスの許可
 resource "google_compute_firewall" "iap" {
@@ -132,9 +138,10 @@ resource "google_compute_router_nat" "nat" {
 }
 
 // Vaultをインストールするインスタンスの設定
-// startup-script を利用してVaultのインストールまで行います
+// startup-script を利用してVaultのインストール&unsealまで行います
 resource "google_compute_instance" "default" {
   name         = "test-vm-kms-vault"
+  // machine_type はもうちょっと上げてもよいかもしれないです
   machine_type = "f1-micro"
   project      = var.vault_project
   zone         = "asia-northeast1-b"
@@ -152,7 +159,6 @@ resource "google_compute_instance" "default" {
   }
   
   metadata_startup_script = file("startup.sh")
-  //metadata_startup_script = "touch /tmp/test"
   
   boot_disk {
     initialize_params {
@@ -172,14 +178,18 @@ resource "google_kms_key_ring" "vault-keyring" {
   project = var.vault_project
 }
 
+// GCSのプロジェクトのGCS用サービスアカウントにVault用プロジェクトの
+// 「クラウド KMS 暗号鍵の暗号化 / 復号化」ロールを付与
 resource "google_project_iam_member" "gcs-serviceaccount-kms-role" {
   project = var.vault_project
   role   = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
   member = "serviceAccount:service-${data.google_project.gcs_project.number}@gs-project-accounts.iam.gserviceaccount.com"
 }
 
+// Vault用プロジェクトのサービスアカウントに
+// 「クラウド KMS 暗号鍵の暗号化 / 復号化」ロールを付与
 resource "google_project_iam_member" "vaul-gce-serviceaccount-kms-role" {
   project = var.vault_project
   role   = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
-  member = "serviceAccount:${google_compute_instance.default.service_account[0].email}"
+  member = "serviceAccount:${data.google_project.vault_project.number}-compute@developer.gserviceaccount.com"
 }
